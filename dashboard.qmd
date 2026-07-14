@@ -1,0 +1,856 @@
+---
+title: "Sri Lanka Dengue Surveillance Dashboard"
+format:
+  dashboard:
+    theme: cosmo
+editor: source
+---
+
+```{r}
+#| label: load-packages
+#| message: false
+#| warning: false
+
+library(dplyr)
+library(lubridate)
+library(ISOweek)
+library(zoo)
+library(plotly)
+library(scales)
+library(DT)
+library(denguedatahub)
+library(e1071)
+library(sf)
+library(geodata)
+library(leaflet)
+library(forecast)
+```
+
+```{r}
+#| label: prepare-data
+#| message: false
+#| warning: false
+
+data("srilanka_weekly_data")
+
+#------------ Cleaning the data set----------------------
+dengue_clean <- srilanka_weekly_data |>
+  mutate(
+    year  = as.integer(year),
+    week  = as.integer(week),
+    cases = as.integer(cases),
+    date  = ISOweek2date(paste0(year, "-W", sprintf("%02d", week), "-1"))
+  ) |>
+  filter(!is.na(date), !is.na(cases))
+
+# -----National weekly totals---------------------------------
+national_weekly <- dengue_clean |>
+  group_by(year, week, date) |>
+  summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop") |>
+  arrange(date)
+
+# Outbreak threshold: Mean + 2 × SD
+outbreak_mean      <- mean(national_weekly$cases)
+outbreak_sd        <- sd(national_weekly$cases)
+outbreak_threshold <- outbreak_mean + 2 * outbreak_sd
+
+national_weekly <- national_weekly |>
+  mutate(
+    MA12_week   = rollmean(cases, k = 12, fill = NA, align = "right"),
+    is_outbreak = cases > outbreak_threshold
+  )
+
+outbreak_weeks <- national_weekly |> filter(is_outbreak)
+
+#------------ Annual totals-------------------------------
+annual_cases <- dengue_clean |>
+  group_by(year) |>
+  summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop")
+
+#------------ District totals-----------------------------
+district_summary <- dengue_clean |>
+  group_by(district) |>
+  summarise(total_cases = sum(cases, na.rm = TRUE), .groups = "drop") |>
+  arrange(desc(total_cases))
+
+district_year <- dengue_clean |>
+  group_by(district, year) |>
+  summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop")
+
+#-------------Seasonality-------------------------------------
+monthly_pattern <- dengue_clean |>
+  mutate(
+    month_num  = month(date),
+    month_name = factor(month(date, label = TRUE, abbr = TRUE),
+                        levels = month(1:12, label = TRUE, abbr = TRUE))
+  ) |>
+  group_by(month_num, month_name) |>
+  summarise(avg_cases = mean(cases, na.rm = TRUE), .groups = "drop") |>
+  arrange(month_num)
+
+monthly_box <- national_weekly |>
+  mutate(
+    month_num  = month(date),
+    month_name = factor(month(date, label = TRUE, abbr = TRUE),
+                        levels = month(1:12, label = TRUE, abbr = TRUE))
+  )
+
+# ── STL decomposition (monthly national) ─────────────────────────────────────
+monthly_national <- dengue_clean |>
+  mutate(month_floor = floor_date(date, "month")) |>
+  group_by(month_floor) |>
+  summarise(cases = sum(cases, na.rm = TRUE), .groups = "drop") |>
+  arrange(month_floor)
+
+ts_dengue  <- ts(monthly_national$cases, frequency = 12,
+                 start = c(year(min(monthly_national$month_floor)),
+                            month(min(monthly_national$month_floor))))
+stl_result <- stl(ts_dengue, s.window = "periodic", robust = TRUE)
+stl_df <- data.frame(
+  date      = monthly_national$month_floor,
+  observed  = as.numeric(stl_result$time.series[,"seasonal"] +
+                         stl_result$time.series[,"trend"]    +
+                         stl_result$time.series[,"remainder"]),
+  trend     = as.numeric(stl_result$time.series[,"trend"]),
+  seasonal  = as.numeric(stl_result$time.series[,"seasonal"]),
+  remainder = as.numeric(stl_result$time.series[,"remainder"])
+)
+
+# --- District boundaries for the map (GADM level 1 = Sri Lanka districts)-------
+lk_districts_raw <- geodata::gadm(country = "LKA", level = 1, path = tempdir()) |>
+  sf::st_as_sf()
+
+
+name_fix <- c(
+  "Moneragala" = "Monaragala"
+)
+
+lk_districts <- lk_districts_raw |>
+  mutate(district = dplyr::recode(NAME_1, !!!name_fix, .default = NAME_1))
+
+map_data <- lk_districts |>
+  left_join(district_summary, by = "district") |>
+  mutate(pct = round(total_cases / sum(total_cases, na.rm = TRUE) * 100, 1))
+
+# --- Forecast: multi-year-ahead ARIMA on national monthly cases------
+
+fc_horizon <- 60
+
+fit_arima  <- forecast::auto.arima(ts_dengue)
+fc         <- forecast::forecast(fit_arima, h = fc_horizon)
+arima_ord  <- forecast::arimaorder(fit_arima)
+
+fc_df <- data.frame(
+  date  = seq(max(monthly_national$month_floor) %m+% months(1),
+              by = "month", length.out = fc_horizon),
+  point = as.numeric(fc$mean),
+  lo80  = as.numeric(fc$lower[, 1]),
+  hi80  = as.numeric(fc$upper[, 1]),
+  lo95  = as.numeric(fc$lower[, 2]),
+  hi95  = as.numeric(fc$upper[, 2])
+) |>
+  mutate(year = year(date), month_num = month(date))
+
+# Annual aggregation 
+hist_annual_mean <- round(mean(annual_cases$cases))
+
+annual_forecast <- fc_df |>
+  group_by(year) |>
+  summarise(
+    n_months = n(),
+    point    = sum(point),
+    lo80     = sum(lo80),
+    hi80     = sum(hi80),
+    lo95     = sum(lo95),
+    hi95     = sum(hi95),
+    .groups  = "drop"
+  ) |>
+  filter(n_months == 12) |>
+  arrange(year) |>
+  mutate(hist_mean = hist_annual_mean)
+
+#--- Hand the forecast data to Observable JS for the interactive year picker -----------------------------------
+fc_monthly_ojs <- fc_df |> mutate(date = as.character(date))
+
+ojs_define(fc_monthly_r = fc_monthly_ojs, fc_annual_r = annual_forecast)
+
+# ----------------KPIs---------------------------------------
+total_cases      <- sum(dengue_clean$cases, na.rm = TRUE)
+peak_year        <- annual_cases |> slice_max(cases, n = 1) |> pull(year)
+peak_cases       <- annual_cases |> slice_max(cases, n = 1) |> pull(cases)
+top_district     <- district_summary$district[1]
+n_outbreak_weeks <- sum(national_weekly$is_outbreak, na.rm = TRUE)
+
+#---- Descriptive stats (for compact card)------------------
+desc_mean   <- round(outbreak_mean, 1)
+desc_median <- median(national_weekly$cases)
+desc_sd     <- round(outbreak_sd, 1)
+desc_skew   <- round(e1071::skewness(national_weekly$cases), 2)
+desc_kurt   <- round(e1071::kurtosis(national_weekly$cases), 2)
+
+#---------- Colour palette---------------------------------
+TEAL  <- "#0D6E6E"
+NAVY  <- "#1A5276"
+RED   <- "#A93226"
+GREEN <- "#117A65"
+LIGHT <- "#A8D5CF"
+top5_colours <- c("#0D6E6E","#1A5276","#A93226","#B7950B","#117A65")
+top5_districts <- district_summary$district[1:5]
+top5_trend <- district_year |> filter(district %in% top5_districts)
+```
+
+# Overview
+
+## Row {height="18%"}
+
+```{r}
+#| content: valuebox
+#| title: "Total Cases (2006 - 2025)"
+list(icon = "bug-fill", color = "teal",
+     value = format(total_cases, big.mark = ","))
+```
+
+```{r}
+#| content: valuebox
+#| title: "Peak Epidemic Year"
+list(icon = "exclamation-triangle-fill", color = "danger",
+     value = paste0(peak_year, "  (", format(peak_cases, big.mark = ","), ")"))
+```
+
+```{r}
+#| content: valuebox
+#| title: "Highest Burden District"
+list(icon = "geo-alt-fill", color = "primary",
+     value = top_district)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Detected Outbreak Weeks"
+list(icon = "exclamation-octagon-fill", color = "warning",
+     value = n_outbreak_weeks)
+```
+
+## Row {height="82%"}
+
+```{r}
+#| title: "Descriptive Statistics of National Weekly Cases"
+
+htmltools::div(
+  style = "padding: 0.8rem 1rem; font-size: 0.92rem; line-height: 2;",
+  htmltools::tags$table(
+    style = "width:100%; border-collapse:collapse;",
+    htmltools::tags$thead(
+      htmltools::tags$tr(
+        htmltools::tags$th(style="text-align:left; border-bottom:2px solid #0D6E6E; padding:4px 8px; color:#0D6E6E;", "Statistic"),
+        htmltools::tags$th(style="text-align:right; border-bottom:2px solid #0D6E6E; padding:4px 8px; color:#0D6E6E;", "Value")
+      )
+    ),
+    htmltools::tags$tbody(
+      htmltools::tags$tr(style="background:#f8f9fa;",
+        htmltools::tags$td(style="padding:5px 8px;", "Mean"),
+        htmltools::tags$td(style="padding:5px 8px; text-align:right; font-weight:600;", format(desc_mean, big.mark=","))
+      ),
+      htmltools::tags$tr(
+        htmltools::tags$td(style="padding:5px 8px;", "Median"),
+        htmltools::tags$td(style="padding:5px 8px; text-align:right; font-weight:600;", format(desc_median, big.mark=","))
+      ),
+      htmltools::tags$tr(style="background:#f8f9fa;",
+        htmltools::tags$td(style="padding:5px 8px;", "Std Deviation"),
+        htmltools::tags$td(style="padding:5px 8px; text-align:right; font-weight:600;", format(desc_sd, big.mark=","))
+      ),
+      htmltools::tags$tr(
+        htmltools::tags$td(style="padding:5px 8px;", "Minimum"),
+        htmltools::tags$td(style="padding:5px 8px; text-align:right; font-weight:600;", "0")
+      ),
+      htmltools::tags$tr(style="background:#f8f9fa;",
+        htmltools::tags$td(style="padding:5px 8px;", "Maximum"),
+        htmltools::tags$td(style="padding:5px 8px; text-align:right; font-weight:600;", format(max(national_weekly$cases), big.mark=","))
+      ),
+      htmltools::tags$tr(
+        htmltools::tags$td(style="padding:5px 8px;", "Skewness"),
+        htmltools::tags$td(style="padding:5px 8px; text-align:right; font-weight:600;", desc_skew)
+      ),
+      htmltools::tags$tr(style="background:#f8f9fa;",
+        htmltools::tags$td(style="padding:5px 8px;", "Kurtosis"),
+        htmltools::tags$td(style="padding:5px 8px; text-align:right; font-weight:600;", desc_kurt)
+      ),
+      htmltools::tags$tr(
+        htmltools::tags$td(style="padding:5px 8px;", "Outbreak Threshold"),
+        htmltools::tags$td(style="padding:5px 8px; text-align:right; font-weight:600; color:#A93226;",
+          paste0(round(outbreak_threshold, 0), " (Mean + 2·SD)"))
+      )
+    )
+  ),
+  htmltools::p(style="font-size:0.78rem; color:#666; margin-top:0.8rem;",
+    "Based on ", format(nrow(national_weekly), big.mark=","),
+    " national weekly observations, 2006 - 2025.")
+)
+```
+
+# Trends and Outbreaks
+
+## Row {height="50%"}
+
+### Column {width="55%"}
+
+```{r}
+#| title: "Annual Dengue Cases (click a bar to highlight that year)"
+
+annual_cases_plot <- annual_cases |>
+  mutate(
+    color = ifelse(year == peak_year,TEAL, TEAL),
+    label = ifelse(year == peak_year,
+                   paste0("<b>", format(cases, big.mark=","), "</b>"),
+                   "")
+  )
+
+plot_ly(
+  data          = annual_cases_plot,
+  x             = ~year,
+  y             = ~cases,
+  type          = "bar",
+  marker        = list(color = ~color, opacity = 0.88),
+  text          = ~label,
+  textposition  = "outside",
+  hovertemplate = "<b>%{x}</b>: %{y:,} cases<extra></extra>"
+) |>
+  layout(
+    xaxis  = list(title = "Year", dtick = 2),
+    yaxis  = list(title = "Annual Cases", tickformat = ","),
+    margin = list(t = 30, b = 10)
+  ) |>
+  config(displayModeBar = FALSE)
+```
+
+### Column {width="45%"}
+
+```{r}
+#| title: "Annual Trend of Top 5 Districts"
+
+p <- plot_ly()
+for (i in seq_along(top5_districts)) {
+  d <- top5_trend |> filter(district == top5_districts[i])
+  p <- p |> add_trace(
+    data = d, x = ~year, y = ~cases,
+    type = "scatter", mode = "lines+markers",
+    name = top5_districts[i],
+    line   = list(color = top5_colours[i], width = 2),
+    marker = list(color = top5_colours[i], size = 5),
+    hovertemplate = paste0("<b>", top5_districts[i], "</b> %{x}: %{y:,}<extra></extra>")
+  )
+}
+p |>
+  layout(
+    xaxis     = list(title = "Year", dtick = 2),
+    yaxis     = list(title = "Annual Cases", tickformat = ","),
+    legend    = list(orientation = "h", y = -0.22),
+    hovermode = "x unified",
+    margin    = list(t = 10, b = 60)
+  ) |>
+  config(displayModeBar = FALSE)
+```
+
+## Row {height="50%"}
+
+```{r}
+#| title: "National Weekly Cases with Outbreak Detection"
+
+plot_ly() |>
+  add_trace(
+    data          = national_weekly,
+    x             = ~date, y = ~cases,
+    type          = "scatter", mode = "lines",
+    line          = list(color = "rgba(13,110,110,0.4)", width = 1),
+    fill          = "tozeroy", fillcolor = "rgba(13,110,110,0.08)",
+    name          = "Weekly Cases",
+    hovertemplate = "%{x|%d %b %Y}: <b>%{y:,}</b><extra></extra>"
+  ) |>
+  add_trace(
+    data          = national_weekly,
+    x             = ~date, y = ~MA12_week,
+    type          = "scatter", mode = "lines",
+    line          = list(color = NAVY, width = 2, dash = "dot"),
+    name          = "12-Week MA",
+    hovertemplate = "%{x|%b %Y} MA: <b>%{y:,.0f}</b><extra></extra>"
+  ) |>
+  add_trace(
+    x         = range(national_weekly$date),
+    y         = c(outbreak_threshold, outbreak_threshold),
+    type      = "scatter", mode = "lines",
+    line      = list(color = RED, width = 1.5, dash = "dash"),
+    name      = paste0("Threshold (", round(outbreak_threshold), ")"),
+    hoverinfo = "skip"
+  ) |>
+  add_trace(
+    data          = outbreak_weeks,
+    x             = ~date, y = ~cases,
+    type          = "scatter", mode = "markers",
+    marker        = list(color = RED, size = 7,
+                         line = list(color = "white", width = 1)),
+    name          = "Outbreak Week",
+    hovertemplate = "<b>⚠ OUTBREAK</b><br>%{x|%d %b %Y}<br>%{y:,} cases<extra></extra>"
+  ) |>
+  layout(
+    xaxis     = list(title = "", tickformat = "%Y",
+                     rangeslider = list(visible = TRUE, thickness = 0.06)),
+    yaxis     = list(title = "National Weekly Cases", tickformat = ","),
+    legend    = list(orientation = "h", y = -0.25),
+    hovermode = "x unified",
+    margin    = list(t = 10, b = 70)
+  ) |>
+  config(displayModeBar = FALSE)
+```
+
+# Seasonality
+
+## Row {height="45%"}
+
+### Column {width="38%"}
+
+```{r}
+#| title: "Average Weekly Cases by Month"
+
+plot_ly(
+  data          = monthly_pattern,
+  x             = ~month_name,
+  y             = ~avg_cases,
+  type          = "bar",
+  marker        = list(
+    color   = ~avg_cases,
+    colorscale = list(c(0, LIGHT), c(1, TEAL)),
+    showscale  = FALSE
+  ),
+  text          = ~round(avg_cases, 0),
+  textposition  = "outside",
+  hovertemplate = "<b>%{x}</b>: %{y:.0f} avg cases<extra></extra>"
+) |>
+  layout(
+    xaxis  = list(title = ""),
+    yaxis  = list(title = "Avg Weekly Cases"),
+    margin = list(t = 10, b = 10)
+  ) |>
+  config(displayModeBar = FALSE)
+```
+
+### Column {width="62%"}
+
+```{r}
+#| title: "Monthly Distribution of Cases"
+
+plot_ly(
+  data          = monthly_box,
+  x             = ~month_name,
+  y             = ~cases,
+  type          = "box",
+  fillcolor     = "rgba(168,213,207,0.45)",
+  line          = list(color = TEAL),
+  marker        = list(color = RED, size = 3, opacity = 0.55),
+  hovertemplate = "<b>%{x}</b><br>Median: %{median:,}<br>Q1: %{q1:,} · Q3: %{q3:,}<extra></extra>"
+) |>
+  layout(
+    xaxis      = list(title = ""),
+    yaxis      = list(title = "National Weekly Cases", tickformat = ","),
+    showlegend = FALSE,
+    margin     = list(t = 10)
+  ) |>
+  config(displayModeBar = FALSE)
+```
+
+## Row {height="55%"}
+
+```{r}
+#| title: "STL Decomposition (drag to zoom)"
+
+p_obs <- plot_ly(data = stl_df, x = ~date, y = ~observed,
+                 type = "scatter", mode = "lines",
+                 line = list(color = TEAL, width = 1.5), name = "Observed",
+                 hovertemplate = "%{x|%b %Y}: <b>%{y:,}</b><extra></extra>") |>
+  layout(yaxis = list(title = "Observed", tickformat = ","),
+         xaxis = list(showticklabels = FALSE))
+
+p_trend <- plot_ly(data = stl_df, x = ~date, y = ~trend,
+                   type = "scatter", mode = "lines",
+                   line = list(color = NAVY, width = 2), name = "Trend",
+                   hovertemplate = "%{x|%b %Y}: <b>%{y:,.0f}</b><extra></extra>") |>
+  layout(yaxis = list(title = "Trend", tickformat = ","),
+         xaxis = list(showticklabels = FALSE))
+
+p_seasonal <- plot_ly(data = stl_df, x = ~date, y = ~seasonal,
+                      type = "scatter", mode = "lines",
+                      line = list(color = GREEN, width = 1.5), name = "Seasonal",
+                      hovertemplate = "%{x|%b %Y}: <b>%{y:,.0f}</b><extra></extra>") |>
+  layout(yaxis = list(title = "Seasonal", tickformat = ","),
+         xaxis = list(showticklabels = FALSE))
+
+p_remainder <- plot_ly(data = stl_df, x = ~date, y = ~remainder,
+                       type = "scatter", mode = "lines+markers",
+                       line   = list(color = RED, width = 1),
+                       marker = list(color = RED, size = 2),
+                       name   = "Remainder",
+                       hovertemplate = "%{x|%b %Y}: <b>%{y:,.0f}</b><extra></extra>") |>
+  layout(yaxis = list(title = "Remainder", tickformat = ","),
+         xaxis = list(title = "Year", tickformat = "%Y"))
+
+subplot(p_obs, p_trend, p_seasonal, p_remainder,
+        nrows = 4, shareX = TRUE, titleY = TRUE,
+        heights = c(0.30, 0.27, 0.22, 0.21)) |>
+  layout(
+    hovermode = "x unified",
+    legend    = list(orientation = "h", y = -0.06),
+    margin    = list(t = 10, l = 75, b = 45)
+  ) |>
+  config(displayModeBar = FALSE)
+```
+
+# Districts
+
+## Row {height="100%"}
+
+### Column {width="42%"}
+
+```{r}
+#| title: "Total Cases per District (2006 - 2025)"
+
+district_pct <- district_summary |>
+  mutate(pct = round(total_cases / sum(total_cases) * 100, 1))
+
+plot_ly(
+  data          = district_pct |>
+                    mutate(district = reorder(district, total_cases)),
+  x             = ~total_cases,
+  y             = ~district,
+  type          = "bar",
+  orientation   = "h",
+  marker        = list(
+    color        = ~total_cases,
+    colorscale   = list(c(0, LIGHT), c(1, TEAL)),
+    showscale    = FALSE
+  ),
+  text          = ~paste0(scales::comma(total_cases), "  (", pct, "%)"),
+  textposition  = "outside",
+  hovertemplate = "<b>%{y}</b><br>%{x:,} cases · %{text}<extra></extra>"
+) |>
+  layout(
+    xaxis  = list(title = "Total Cases", tickformat = ","),
+    yaxis  = list(title = ""),
+    height = 580,
+    margin = list(t = 10, r = 140)
+  ) |>
+  config(displayModeBar = FALSE)
+```
+
+### Column {width="58%"}
+
+```{r}
+#| title: "District × Year Heatmap"
+
+dh <- district_year |>
+  mutate(district = factor(district, levels = district_summary$district))
+
+plot_ly(
+  data          = dh,
+  x             = ~year,
+  y             = ~district,
+  z             = ~cases,
+  type          = "heatmap",
+  colorscale    = list(c(0,"#E8F8F5"), c(0.5, TEAL), c(1, RED)),
+  colorbar      = list(title = "Cases", tickformat = ","),
+  hovertemplate = "<b>%{y}</b> · %{x}<br>Cases: <b>%{z:,}</b><extra></extra>"
+) |>
+  layout(
+    xaxis  = list(title = "Year", dtick = 2),
+    yaxis  = list(title = "", autorange = "reversed"),
+    height = 580,
+    margin = list(t = 10, l = 100)
+  ) |>
+  config(displayModeBar = FALSE)
+```
+
+# Map
+
+## Row {height="100%"}
+
+```{r}
+#| title: "Total Dengue Cases by District, Sri Lanka (2006 - 2025)"
+
+pal <- leaflet::colorNumeric(
+  palette = c(LIGHT, TEAL, RED),
+  domain  = map_data$total_cases
+)
+
+leaflet::leaflet(map_data) |>
+  leaflet::addProviderTiles("CartoDB.Positron") |>
+  leaflet::addPolygons(
+    fillColor    = ~pal(total_cases),
+    fillOpacity  = 0.82,
+    color        = "white",
+    weight       = 1,
+    label        = ~paste0(district, ": ", format(total_cases, big.mark = ","),
+                            " cases (", pct, "%)"),
+    highlightOptions = leaflet::highlightOptions(
+      weight = 2, color = "#333", bringToFront = TRUE
+    )
+  ) |>
+  leaflet::addLegend(
+    pal      = pal,
+    values   = ~total_cases,
+    title    = "Total Cases",
+    position = "bottomright"
+  )
+```
+
+# Forecasting
+
+## Row {height="12%"}
+
+```{ojs}
+//| title: "Choose a year to forecast"
+
+fc_annual = transpose(fc_annual_r)
+
+viewof selected_year = Inputs.select(
+  fc_annual.map(d => d.year),
+  {
+    label: "Year",
+    value: fc_annual[0].year
+  }
+)
+```
+
+## Row {height="23%"}
+
+```{ojs}
+//| title: "Forecasted Total Cases"
+
+selected = fc_annual.find(d => d.year === selected_year)
+
+html`<div style="text-align:center; padding-top:0.6rem;">
+  <div style="font-size:2rem; font-weight:700; color:#0D6E6E;">
+    ${selected.point.toLocaleString(undefined, {maximumFractionDigits: 0})}
+  </div>
+  <div style="font-size:0.8rem; color:#666;">
+    95% CI: ${selected.lo95.toLocaleString(undefined, {maximumFractionDigits: 0})}
+    &ndash; ${selected.hi95.toLocaleString(undefined, {maximumFractionDigits: 0})}
+  </div>
+</div>`
+```
+
+```{ojs}
+//| title: "Historical Annual Average"
+
+delta_pct = ((selected.point - selected.hist_mean) / selected.hist_mean) * 100
+
+html`<div style="text-align:center; padding-top:0.6rem;">
+  <div style="font-size:2rem; font-weight:700; color:${delta_pct >= 0 ? "#A93226" : "#117A65"};">
+    ${delta_pct >= 0 ? "+" : ""}${delta_pct.toFixed(1)}%
+  </div>
+  <div style="font-size:0.8rem; color:#666;">
+    Historical average: ${selected.hist_mean.toLocaleString()} cases/year
+  </div>
+</div>`
+```
+
+```{ojs}
+//| title: "Outbreak Risk Signal"
+
+risk = delta_pct > 50 ? "High" : (delta_pct > 0 ? "Moderate" : "Low")
+risk_colour = risk === "High" ? "#A93226" : (risk === "Moderate" ? "#B7950B" : "#117A65")
+
+html`<div style="text-align:center; padding-top:0.6rem;">
+  <div style="font-size:2rem; font-weight:700; color:${risk_colour};">
+    ${risk}
+  </div>
+  <div style="font-size:0.8rem; color:#666;">
+    Relative to the 2006&ndash;2025 annual average
+  </div>
+</div>`
+```
+
+## Row {height="65%"}
+
+### Column {width="45%"}
+
+```{ojs}
+//| title: "Monthly Forecast for the Selected Year"
+
+fc_monthly = transpose(fc_monthly_r).map(d => ({...d, date: new Date(d.date)}))
+
+monthly_selected = fc_monthly.filter(d => d.year === selected_year)
+
+Plot.plot({
+  width: 480,
+  height: 340,
+  marginLeft: 60,
+  y: {label: "Forecasted Monthly Cases", grid: true},
+  x: {label: null, type: "utc", tickFormat: "%b"},
+  marks: [
+    Plot.areaY(monthly_selected, {x: "date", y1: "lo95", y2: "hi95", fill: "#A93226", fillOpacity: 0.15}),
+    Plot.areaY(monthly_selected, {x: "date", y1: "lo80", y2: "hi80", fill: "#A93226", fillOpacity: 0.30}),
+    Plot.line(monthly_selected, {x: "date", y: "point", stroke: "#A93226", strokeWidth: 2}),
+    Plot.dot(monthly_selected, {x: "date", y: "point", fill: "#A93226", r: 3}),
+    Plot.ruleY([0])
+  ]
+})
+```
+
+### Column {width="55%"}
+
+```{r}
+#| title: "Full Forecast Overview  (ARIMA)"
+
+plot_ly() |>
+  add_trace(
+    data = monthly_national, x = ~month_floor, y = ~cases,
+    type = "scatter", mode = "lines",
+    line = list(color = TEAL, width = 1.5), name = "Observed",
+    hovertemplate = "%{x|%b %Y}: <b>%{y:,}</b><extra></extra>"
+  ) |>
+  add_trace(
+    data = fc_df, x = ~date, y = ~hi95,
+    type = "scatter", mode = "lines",
+    line = list(width = 0), showlegend = FALSE, hoverinfo = "skip"
+  ) |>
+  add_trace(
+    data = fc_df, x = ~date, y = ~lo95,
+    type = "scatter", mode = "lines",
+    fill = "tonexty", fillcolor = "rgba(169,50,38,0.15)",
+    line = list(width = 0), name = "95% CI", hoverinfo = "skip"
+  ) |>
+  add_trace(
+    data = fc_df, x = ~date, y = ~hi80,
+    type = "scatter", mode = "lines",
+    line = list(width = 0), showlegend = FALSE, hoverinfo = "skip"
+  ) |>
+  add_trace(
+    data = fc_df, x = ~date, y = ~lo80,
+    type = "scatter", mode = "lines",
+    fill = "tonexty", fillcolor = "rgba(169,50,38,0.30)",
+    line = list(width = 0), name = "80% CI", hoverinfo = "skip"
+  ) |>
+  add_trace(
+    data = fc_df, x = ~date, y = ~point,
+    type = "scatter", mode = "lines",
+    line = list(color = RED, width = 2, dash = "dash"), name = "Forecast",
+    hovertemplate = "%{x|%b %Y} forecast: <b>%{y:,.0f}</b><extra></extra>"
+  ) |>
+  layout(
+    xaxis     = list(title = "", tickformat = "%Y"),
+    yaxis     = list(title = "Monthly Cases", tickformat = ","),
+    legend    = list(orientation = "h", y = -0.15),
+    hovermode = "x unified",
+    margin    = list(t = 10, b = 40),
+    annotations = list(
+      x = 0, y = 1.08, xref = "paper", yref = "paper", showarrow = FALSE,
+      text = paste0("Model: ARIMA(", paste(arima_ord[1:3], collapse = ","), ")"),
+      font = list(size = 11, color = "#666")
+    )
+  ) |>
+  config(displayModeBar = FALSE)
+```
+
+# Data Explorer
+
+## Row
+
+```{r}
+#| title: "Weekly District-Level Dataset - filter any column, sort, search"
+
+dengue_clean |>
+  select(Year = year, Week = week, Date = date, District = district, Cases = cases) |>
+  arrange(desc(Year), desc(Week)) |>
+  DT::datatable(
+    filter   = "top",
+    rownames = FALSE,
+    extensions = "Buttons",
+    options  = list(
+      pageLength = 25,
+      scrollX    = TRUE,
+      dom        = "Bfrtip",
+      buttons    = list("csv", "excel")
+    )
+  )
+```
+
+# About
+
+## Row
+
+### Column {width="58%"}
+
+```{r}
+htmltools::div(
+  style = "padding:1rem 1.2rem; line-height:1.9; font-size:.93rem;",
+
+  htmltools::h4("Sri Lanka Dengue Surveillance Dashboard"),
+  htmltools::p(
+    "Weekly dengue case data for all ", htmltools::strong("26 districts"),
+    " of Sri Lanka, covering ", htmltools::strong("2006 - 2025"),
+    ". Source: ", htmltools::code("denguedatahub"),
+    " R package (Talagala T.S., CRAN 2024), derived from the ",
+    htmltools::em("Weekly Epidemiological Reports"),
+    " of the Epidemiology Unit, Ministry of Health, Sri Lanka."
+  ),
+
+  htmltools::h5("Dashboard tabs"),
+  htmltools::tags$ul(
+    htmltools::tags$li(htmltools::strong("Overview - "),
+      "4 KPI cards and descriptive statistics table of national weekly cases."),
+    htmltools::tags$li(htmltools::strong("Trends and Outbreaks - "),
+      "Annual bar chart, top-5 district trends, weekly time series with statistical outbreak detection (threshold = Mean + 2×SD) and interactive range slider."),
+    htmltools::tags$li(htmltools::strong("Seasonality - "),
+      "Average monthly bar, monthly case distribution box plot, STL decomposition (Observed / Trend / Seasonal / Remainder)."),
+    htmltools::tags$li(htmltools::strong("Districts - "),
+      "All-district ranked bar with % share labels, district × year heatmap with diverging colour scale."),
+    htmltools::tags$li(htmltools::strong("Map - "),
+      "Interactive choropleth of Sri Lanka showing total dengue cases by district."),
+    htmltools::tags$li(htmltools::strong("Forecasting - "),
+      "Interactive year picker (2026-2031) showing the ARIMA-forecasted annual case total, its 95% prediction interval, an outbreak-risk signal versus the 2006-2025 historical average, a monthly breakdown chart for the chosen year, and a full multi-year forecast overview with 80%/95% confidence bands."),
+    htmltools::tags$li(htmltools::strong("Data Explorer - "),
+      "Full filterable weekly dataset with CSV / Excel export buttons."),
+  
+  ),
+
+  htmltools::h5("Key findings"),
+  htmltools::tags$ul(
+    htmltools::tags$li(htmltools::strong("2017"), " was an unprecedented epidemic - over 174,000 national cases."),
+    htmltools::tags$li(htmltools::strong("Colombo"), " is the highest-burden district (~174 K cumulative cases), reflecting high density and urbanisation."),
+    htmltools::tags$li("Primary transmission peak: ", htmltools::strong("June - July"), " (south-west monsoon)."),
+    htmltools::tags$li("Secondary peak: ", htmltools::strong("November - December"), " (north-east monsoon transition)."),
+    htmltools::tags$li("STL decomposition confirms a ", htmltools::strong("strong annual seasonal cycle"), " throughout the study period.")
+  ),
+
+  htmltools::h5("Methods"),
+  htmltools::tags$ul(
+    htmltools::tags$li("ISO year-week → date conversion via ",
+      htmltools::code("ISOweek::ISOweek2date()"), "."),
+    htmltools::tags$li("12-period rolling mean: ", htmltools::code("zoo::rollmean(k = 12, align = 'right')"), "."),
+    htmltools::tags$li("Outbreak threshold: ", htmltools::em("Mean + 2 × SD"), " of national weekly totals."),
+    htmltools::tags$li("STL: ", htmltools::code("stats::stl(s.window='periodic', robust=TRUE)"),
+      " on monthly national aggregates."),
+    htmltools::tags$li("District boundaries: ", htmltools::code("geodata::gadm('LKA', level = 1)"),
+      " (GADM administrative boundaries)."),
+    htmltools::tags$li("Forecast: ", htmltools::code("forecast::auto.arima()"),
+      " fitted to monthly national totals, 60-month (5-year) horizon, 80%/95% prediction intervals; annual totals shown for years with a complete 12-month forecast."),
+    htmltools::tags$li("Forecasting tab interactivity implemented client-side with ",
+      htmltools::code("ojs_define()"), " and Observable JS ", htmltools::code("Inputs.select()"), ".")
+  ),
+
+  htmltools::hr(),
+  htmltools::p(style="font-size:.82rem; color:#555;",
+    htmltools::em("Talagala T.S. et al. (2024). denguedatahub. CRAN v2.1.1. | Dashboard: AS2022523"))
+)
+```
+
+### Column {width="42%"}
+
+```{r}
+htmltools::div(
+  style = "padding:1rem 1.2rem;",
+  htmltools::h5("All 26 Districts"),
+  htmltools::tags$ul(
+    style = "column-count:2; font-size:.9rem; line-height:2.1;",
+    lapply(sort(unique(dengue_clean$district)), htmltools::tags$li)
+  )
+)
+```
